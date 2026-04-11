@@ -10,10 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"context"
 	"sort"
 	"sync"
 
 	"github.com/mcuadros/go-rpi-rgb-led-matrix"
+	"github.com/wu/keyop-messenger"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
@@ -136,35 +138,48 @@ func (p *RGBMatrixPlugin) colorRGBA(r, g, b, a uint8) color.RGBA {
 // Check performs the service's periodic work: collect data, evaluate state, and publish messages/metrics.
 func (p *RGBMatrixPlugin) Check() error {
 	logger := p.deps.MustGetLogger()
-	logger.Warn("RGBMatrixPlugin Check called")
+	logger.Info("RGBMatrixPlugin Check called")
 
 	ctx := p.deps.MustGetContext()
-	messenger := p.deps.MustGetMessenger()
+	newMsgr := p.deps.GetNewMessenger()
+	if newMsgr == nil {
+		return fmt.Errorf("rgbmatrix: new messenger not initialized")
+	}
 
-	err := messenger.Subscribe(ctx, "rgbMatrix", "status-shared", "plugin", "rgbMatrix", 0, func(msg core.Message) error {
+	// Register payload types
+	if err := newMsgr.RegisterPayloadType("core.temp.v1", &core.TempEvent{}); err != nil {
+		if !core.IsDuplicatePayloadRegistration(err) {
+			logger.Error("rgbmatrix: failed to register core.temp.v1", "error", err)
+			return err
+		}
+	}
+
+	// Subscribe to temp channel
+	subscriberID := "rgbmatrix-temp"
+	logger.Info("rgbmatrix: subscribing to temp channel", "subscriberID", subscriberID)
+	if err := newMsgr.Subscribe(ctx, "temp", subscriberID, func(msgCtx context.Context, msg messenger.Message) error {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 
-		if msg.ServiceType != "temp" && !strings.HasPrefix(msg.MetricName, "temp") {
+		// Decode the temperature event
+		var tempEvent *core.TempEvent
+		if te, ok := msg.Payload.(*core.TempEvent); ok {
+			tempEvent = te
+		} else if te, ok := msg.Payload.(core.TempEvent); ok {
+			tempEvent = &te
+		} else {
+			logger.Info("rgbmatrix: received non-TempEvent message", "payloadType", msg.PayloadType, "payloadType_actual", fmt.Sprintf("%T", msg.Payload))
 			return nil
 		}
 
-		logger.Debug("Got temp update", "serviceName", msg.ServiceName, "metricName", msg.MetricName, "metric", msg.Metric, "status", msg.Status)
+		// Use sensor name if available, otherwise use origin
+		sensorName := tempEvent.SensorName
+		if sensorName == "" {
+			sensorName = msg.Origin
+		}
 
-		//// Extract core.TempEvent from payload
-		//var tempF float64
-		//if tempEvent, ok := core.AsType[*core.TempEvent](msg.Data); ok && tempEvent != nil {
-		//	tempF = float64(tempEvent.TempF)
-		//} else if tempEvent, ok := core.AsType[core.TempEvent](msg.Data); ok {
-		//	tempF = float64(tempEvent.TempF)
-		//}
-
-		//2026-04-05 16:53:45 WARN  | GOT METRIC msg={1.0 2026-04-05 16:53:39.423747326 -0700 PDT b23776be-8a46-4105-b9d5-9e3e4d1bba5f b16edcfc-d9df-4545-8a64-daf37d1a4ab5 northernlights status-shared metricmon temp-lab-status threshold_status ok temp.lab is 78.687°F  temp.lab is 78.7° 78.68659973144531 temp.lab  0x6e90e40 core.status.v1 [northernlights:status northernlights:webSocketClient:web-socket-client keyop:status-shared keyop:webSocketServer:web-socket-server goldenpineapple:webSocketClient:web-socket-client goldenpineapple:status-shared goldenpineapple:plugin:rgbMatrix] [] 0}
-		//2026-04-05 16:53:45 WARN  | Got temp update serviceName=temp-lab-status metricName=temp.lab metric=78.68659973144531 status=ok
-		//2026-04-05 16:53:45 WARN  | TEMP tempf=0
-
-		p.temps[msg.MetricName] = msg.Metric
-		p.statuses[msg.MetricName] = msg.Status
+		p.temps[sensorName] = float64(tempEvent.TempF)
+		p.statuses[sensorName] = "ok" // Default status
 
 		// Update sorted names
 		names := make([]string, 0, len(p.temps))
@@ -173,10 +188,12 @@ func (p *RGBMatrixPlugin) Check() error {
 		}
 		sort.Strings(names)
 		p.tempNames = names
+
+		logger.Info("Got temp update", "sensorName", sensorName, "tempF", tempEvent.TempF, "totalTemps", len(p.temps))
 		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("failed to subscribe to status channel: %w", err)
+	}); err != nil {
+		logger.Error("rgbmatrix: failed to subscribe to temp channel", "error", err)
+		return fmt.Errorf("rgbmatrix: failed to subscribe to temp channel: %w", err)
 	}
 
 	ticker := time.NewTicker(1 * time.Second)
@@ -194,7 +211,7 @@ func (p *RGBMatrixPlugin) Check() error {
 		select {
 		case <-ctx.Done():
 			logger.Info("RGBMatrixPlugin Check context cancelled")
-			err = p.canvas.Clear()
+			err := p.canvas.Clear()
 			if err != nil {
 				return fmt.Errorf("failed to clear canvas: %w", err)
 			}
@@ -255,7 +272,7 @@ func (p *RGBMatrixPlugin) Render() error {
 		if p.tempIdx >= len(p.tempNames) {
 			p.tempIdx = 0
 		}
-		if p.tempNames[p.tempIdx] == "temp.outside" {
+		if p.tempNames[p.tempIdx] == "outdoor" {
 			// Skip outside temp in cycle since it's always shown as main temp
 			p.tempIdx = (p.tempIdx + 1) % len(p.tempNames)
 		}
@@ -263,7 +280,7 @@ func (p *RGBMatrixPlugin) Render() error {
 		temp := p.temps[name]
 
 		// todo: main temp should be configurable
-		mainTemp, ok := p.temps["temp.outside"]
+		mainTemp, ok := p.temps["outdoor"]
 		if !ok {
 			mainTemp = 0.0
 		}
@@ -283,7 +300,7 @@ func (p *RGBMatrixPlugin) Render() error {
 		}
 		mainTempStr := fmt.Sprintf("%.1f", mainTemp)
 		d.Face = p.bigFace
-		d.Src = image.NewUniform(p.getTempColor(p.statuses["temp.outside"]))
+		d.Src = image.NewUniform(p.getTempColor(p.statuses["outdoor"]))
 		d.Dot = fixed.Point26_6{X: fixed.I(0), Y: fixed.I(20)}
 		d.DrawString(mainTempStr)
 
