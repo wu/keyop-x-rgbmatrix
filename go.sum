@@ -25,8 +25,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/wu/keyop-messenger v0.9.0/go.mod h1:g4Dn/wUZ6LmCOhzmoqH6G0WHK5TOG7h5ow6liYYRMR4=
-github.com/wu/keyop-messenger v0.10.1/go.mod h1:g4Dn/wUZ6LmCOhzmoqH6G0WHK5TOG7h5ow6liYYRMR4=
+github.com/wu/keyop-messenger v0.11.0 h1:scwxdFKY4l/Ur7JCC6H4PtW7FdLc1fuL+W1Ft+RaXJI=
+github.com/wu/keyop-messenger v0.11.0/go.mod h1:g4Dn/wUZ6LmCOhzmoqH6G0WHK5TOG7h5ow6liYYRMR4=
 golang.org/x/exp/shiny v0.0.0-20260212183809-81e46e3db34a h1:pCkykR/N0jWVZoY0vl/3zjgys3YxHlrcTlJ/xL9ZMps=
 golang.org/x/exp/shiny v0.0.0-20260212183809-81e46e3db34a/go.mod h1:zxsA7NyDTOUjcveVwAMFI/YIErWwayTW/4RGqB/RzKk=
 golang.org/x/image v0.36.0 h1:Iknbfm1afbgtwPTmHnS2gTM/6PPZfH+z2EFuOkSbqwc=

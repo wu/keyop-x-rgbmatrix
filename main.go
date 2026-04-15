@@ -30,6 +30,7 @@ type RGBMatrixPlugin struct {
 	smallFace  font.Face
 	mediumFace font.Face
 	swapGB     bool
+	ctx        context.Context
 
 	mu        sync.RWMutex
 	temps     map[string]float64
@@ -140,7 +141,6 @@ func (p *RGBMatrixPlugin) Check() error {
 	logger := p.deps.MustGetLogger()
 	logger.Info("RGBMatrixPlugin Check called")
 
-	ctx := p.deps.MustGetContext()
 	newMsgr := p.deps.GetNewMessenger()
 	if newMsgr == nil {
 		return fmt.Errorf("rgbmatrix: new messenger not initialized")
@@ -157,7 +157,7 @@ func (p *RGBMatrixPlugin) Check() error {
 	// Subscribe to temp channel
 	subscriberID := "rgbmatrix-temp"
 	logger.Info("rgbmatrix: subscribing to temp channel", "subscriberID", subscriberID)
-	if err := newMsgr.Subscribe(ctx, "temp", subscriberID, func(msgCtx context.Context, msg messenger.Message) error {
+	if err := newMsgr.Subscribe(p.ctx, "temp", subscriberID, func(msgCtx context.Context, msg messenger.Message) error {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 
@@ -209,13 +209,13 @@ func (p *RGBMatrixPlugin) Check() error {
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-p.ctx.Done():
 			logger.Info("RGBMatrixPlugin Check context cancelled")
 			err := p.canvas.Clear()
 			if err != nil {
 				return fmt.Errorf("failed to clear canvas: %w", err)
 			}
-			return ctx.Err()
+			return p.ctx.Err()
 		case <-cycleTicker.C:
 			p.mu.Lock()
 			if len(p.tempNames) > 0 {
@@ -353,9 +353,11 @@ func (p *RGBMatrixPlugin) ValidateConfig() []error {
 }
 
 // NewService creates a new service using the provided dependencies and configuration.
-func NewService(deps core.Dependencies, cfg core.ServiceConfig) core.Service {
+func NewService(deps core.Dependencies, cfg core.ServiceConfig, ctx context.Context) core.Service {
+
 	return &RGBMatrixPlugin{
 		deps: deps,
 		cfg:  cfg,
+		ctx:  ctx,
 	}
 }
