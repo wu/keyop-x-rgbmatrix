@@ -141,7 +141,7 @@ func (p *RGBMatrixPlugin) Check() error {
 	logger := p.deps.MustGetLogger()
 	logger.Info("RGBMatrixPlugin Check called")
 
-	newMsgr := p.deps.GetNewMessenger()
+	newMsgr := p.deps.MustGetMessenger()
 	if newMsgr == nil {
 		return fmt.Errorf("rgbmatrix: new messenger not initialized")
 	}
