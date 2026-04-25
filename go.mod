@@ -2,13 +2,14 @@ module keyop/plugins/rgbMatrix
 
 go 1.26
 
-replace keyop => ../keyop
+require github.com/wu/keyop v0.0.0
+
+replace github.com/wu/keyop => ../keyop-public
 
 require (
 	github.com/mcuadros/go-rpi-rgb-led-matrix v0.0.0-20180401002551-b26063b3169a
 	github.com/wu/keyop-messenger v0.14.0
 	golang.org/x/image v0.36.0
-	keyop v0.0.0-00010101000000-000000000000
 )
 
 require (

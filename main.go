@@ -5,7 +5,6 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
-	"keyop/core"
 	"os"
 	"strings"
 	"time"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/mcuadros/go-rpi-rgb-led-matrix"
 	"github.com/wu/keyop-messenger"
+	"github.com/wu/keyop/core"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
