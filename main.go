@@ -32,12 +32,14 @@ type RGBMatrixPlugin struct {
 	swapGB     bool
 	ctx        context.Context
 
-	mu        sync.RWMutex
-	temps     map[string]float64
-	statuses  map[string]string
-	tempNames []string
-	tempIdx   int
-	nameMap   map[string]string
+	mu           sync.RWMutex
+	temps        map[string]float64
+	statuses     map[string]string
+	lastUpdate   map[string]time.Time
+	tempNames    []string
+	tempIdx      int
+	nameMap      map[string]string
+	mainTempName string
 }
 
 // Initialize performs one-time startup required by the service (resource loading or connectivity checks).
@@ -65,6 +67,9 @@ func (p *RGBMatrixPlugin) Initialize() error {
 	if v, ok := p.cfg.Config["swap_gb"].(bool); ok {
 		p.swapGB = v
 	}
+	if v, ok := p.cfg.Config["main_temp_name"].(string); ok {
+		p.mainTempName = v
+	}
 
 	m, err := rgbmatrix.NewRGBLedMatrix(config)
 	if err != nil {
@@ -75,6 +80,7 @@ func (p *RGBMatrixPlugin) Initialize() error {
 	p.canvas = rgbmatrix.NewCanvas(p.matrix)
 	p.temps = make(map[string]float64)
 	p.statuses = make(map[string]string)
+	p.lastUpdate = make(map[string]time.Time)
 	p.nameMap = make(map[string]string)
 
 	if v, ok := p.cfg.Config["temp_name_map"].(map[string]interface{}); ok {
@@ -147,39 +153,40 @@ func (p *RGBMatrixPlugin) Check() error {
 	}
 
 	// Register payload types
-	if err := newMsgr.RegisterPayloadType("core.temp.v1", &core.TempEvent{}); err != nil {
+	if err := newMsgr.RegisterPayloadType("core.status.v1", &core.StatusEvent{}); err != nil {
 		if !core.IsDuplicatePayloadRegistration(err) {
-			logger.Error("rgbmatrix: failed to register core.temp.v1", "error", err)
+			logger.Error("rgbmatrix: failed to register core.status.v1", "error", err)
 			return err
 		}
 	}
 
-	// Subscribe to temp channel
-	subscriberID := "rgbmatrix-temp"
-	logger.Info("rgbmatrix: subscribing to temp channel", "subscriberID", subscriberID)
-	if err := newMsgr.Subscribe(p.ctx, "temp", subscriberID, func(msgCtx context.Context, msg messenger.Message) error {
+	// Subscribe to status channel
+	subscriberID := "rgbmatrix-status"
+	logger.Info("rgbmatrix: subscribing to status channel", "subscriberID", subscriberID)
+	if err := newMsgr.Subscribe(p.ctx, "status", subscriberID, func(msgCtx context.Context, msg messenger.Message) error {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 
-		// Decode the temperature event
-		var tempEvent *core.TempEvent
-		if te, ok := msg.Payload.(*core.TempEvent); ok {
-			tempEvent = te
-		} else if te, ok := msg.Payload.(core.TempEvent); ok {
-			tempEvent = &te
+		// Decode the status event
+		var statusEvent *core.StatusEvent
+		if se, ok := msg.Payload.(*core.StatusEvent); ok {
+			statusEvent = se
+		} else if se, ok := msg.Payload.(core.StatusEvent); ok {
+			statusEvent = &se
 		} else {
-			logger.Info("rgbmatrix: received non-TempEvent message", "payloadType", msg.PayloadType, "payloadType_actual", fmt.Sprintf("%T", msg.Payload))
 			return nil
 		}
 
-		// Use sensor name if available, otherwise use origin
-		sensorName := tempEvent.SensorName
-		if sensorName == "" {
-			sensorName = msg.Origin
+		// Only handle status events that carry a metric source payload
+		metric, ok := core.ExtractSourcePayload[core.MetricEvent](statusEvent)
+		if !ok {
+			return nil
 		}
 
-		p.temps[sensorName] = float64(tempEvent.TempF)
-		p.statuses[sensorName] = "ok" // Default status
+		sensorName := statusEvent.Name
+		p.temps[sensorName] = metric.Value
+		p.statuses[sensorName] = statusEvent.Status
+		p.lastUpdate[sensorName] = msg.Timestamp
 
 		// Update sorted names
 		names := make([]string, 0, len(p.temps))
@@ -189,11 +196,11 @@ func (p *RGBMatrixPlugin) Check() error {
 		sort.Strings(names)
 		p.tempNames = names
 
-		logger.Info("Got temp update", "sensorName", sensorName, "tempF", tempEvent.TempF, "totalTemps", len(p.temps))
+		logger.Info("Got temp status update", "sensorName", sensorName, "tempF", metric.Value, "status", statusEvent.Status, "totalTemps", len(p.temps))
 		return nil
 	}); err != nil {
-		logger.Error("rgbmatrix: failed to subscribe to temp channel", "error", err)
-		return fmt.Errorf("rgbmatrix: failed to subscribe to temp channel: %w", err)
+		logger.Error("rgbmatrix: failed to subscribe to status channel", "error", err)
+		return fmt.Errorf("rgbmatrix: failed to subscribe to status channel: %w", err)
 	}
 
 	ticker := time.NewTicker(1 * time.Second)
@@ -272,15 +279,14 @@ func (p *RGBMatrixPlugin) Render() error {
 		if p.tempIdx >= len(p.tempNames) {
 			p.tempIdx = 0
 		}
-		if p.tempNames[p.tempIdx] == "outdoor" {
-			// Skip outside temp in cycle since it's always shown as main temp
+		if p.mainTempName != "" && p.tempNames[p.tempIdx] == p.mainTempName {
+			// Skip main temp in cycle since it's always shown separately
 			p.tempIdx = (p.tempIdx + 1) % len(p.tempNames)
 		}
 		name := p.tempNames[p.tempIdx]
 		temp := p.temps[name]
 
-		// todo: main temp should be configurable
-		mainTemp, ok := p.temps["outdoor"]
+		mainTemp, ok := p.temps[p.mainTempName]
 		if !ok {
 			mainTemp = 0.0
 		}
@@ -300,19 +306,19 @@ func (p *RGBMatrixPlugin) Render() error {
 		}
 		mainTempStr := fmt.Sprintf("%.1f", mainTemp)
 		d.Face = p.bigFace
-		d.Src = image.NewUniform(p.getTempColor(p.statuses["outdoor"]))
+		d.Src = image.NewUniform(p.getTempColorWithStaleness(p.statuses[p.mainTempName], p.lastUpdate[p.mainTempName]))
 		d.Dot = fixed.Point26_6{X: fixed.I(0), Y: fixed.I(20)}
 		d.DrawString(mainTempStr)
 
 		tempStr := fmt.Sprintf("%.1f", temp)
 		d.Face = p.bigFace
-		d.Src = image.NewUniform(p.getTempColor(p.statuses[name]))
+		d.Src = image.NewUniform(p.getTempColorWithStaleness(p.statuses[name], p.lastUpdate[name]))
 		d.Dot = fixed.Point26_6{X: fixed.I(26), Y: fixed.I(20)}
 		d.DrawString(tempStr)
 
 		tempNameStr := fmt.Sprintf("%s", displayName)
 		d.Face = p.bigFace
-		d.Src = image.NewUniform(p.getTempColor(p.statuses[name]))
+		d.Src = image.NewUniform(p.getTempColorWithStaleness(p.statuses[name], p.lastUpdate[name]))
 		d.Dot = fixed.Point26_6{X: fixed.I(52), Y: fixed.I(20)}
 		d.DrawString(tempNameStr)
 	}
@@ -337,14 +343,24 @@ func (p *RGBMatrixPlugin) Render() error {
 func (p *RGBMatrixPlugin) getTempColor(status string) color.RGBA {
 	switch status {
 	case "warning":
-		return p.colorRGBA(50, 50, 255, 255)
+		return p.colorRGBA(255, 200, 0, 255)
 	case "critical":
 		return p.colorRGBA(255, 0, 0, 255)
 	case "ok":
 		return p.colorRGBA(0, 100, 0, 255)
+	case "stale":
+		return p.colorRGBA(80, 80, 80, 255)
 	default:
 		return p.colorRGBA(50, 50, 50, 255)
 	}
+}
+
+func (p *RGBMatrixPlugin) getTempColorWithStaleness(status string, lastUpdate time.Time) color.RGBA {
+	// Check if data is stale (no update in 15+ minutes)
+	if !lastUpdate.IsZero() && time.Since(lastUpdate) >= 15*time.Minute {
+		return p.colorRGBA(80, 80, 80, 255)
+	}
+	return p.getTempColor(status)
 }
 
 // ValidateConfig validates the service configuration and returns any validation errors.
