@@ -177,13 +177,16 @@ func (p *RGBMatrixPlugin) Check() error {
 			return nil
 		}
 
-		// Only handle status events that carry a metric source payload
 		metric, ok := core.ExtractSourcePayload[core.MetricEvent](statusEvent)
+		if !ok || metric.SourcePayloadType != "core.temp.v1" {
+			return nil
+		}
+		tempEvent, ok := core.ExtractMetricSourcePayload[core.TempEvent](metric)
 		if !ok {
 			return nil
 		}
 
-		sensorName := statusEvent.Name
+		sensorName := tempEvent.SensorName
 		p.temps[sensorName] = metric.Value
 		p.statuses[sensorName] = statusEvent.Status
 		p.lastUpdate[sensorName] = msg.Timestamp
