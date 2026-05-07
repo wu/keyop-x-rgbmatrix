@@ -1,17 +1,18 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 	"os"
-	"strings"
-	"time"
-
-	"context"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/mcuadros/go-rpi-rgb-led-matrix"
 	"github.com/wu/keyop-messenger"
@@ -20,6 +21,65 @@ import (
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
 )
+
+// Payload type strings matching the canonical values defined in the respective service packages.
+const (
+	moonEventType           = "service.moon.v1"
+	sunEventType            = "service.sun.v1"
+	weatherEventType        = "service.weather.v1"
+	weatherRequestEventType = "service.weather.request.v1"
+	tideEventType           = "service.tide.v1"
+)
+
+// infoMessage holds a rotating bottom-row display item with staleness tracking.
+type infoMessage struct {
+	Label     string
+	TargetAt  time.Time
+	UpdatedAt time.Time
+}
+
+// moonPayload extracts the fields we need from service.moon.v1 events.
+type moonPayload struct {
+	NextMajorName string `json:"next_major_name"`
+	NextMajorTime string `json:"next_major_time"`
+}
+
+// sunPayload extracts the fields we need from service.sun.v1 events.
+type sunPayload struct {
+	CivilDawn time.Time `json:"civil_dawn"`
+	CivilDusk time.Time `json:"civil_dusk"`
+}
+
+// weatherPeriod extracts the fields we need from a ForecastPeriod.
+type weatherPeriod struct {
+	IsDaytime   bool    `json:"isDaytime"`
+	Temperature float64 `json:"temperature"`
+}
+
+// weatherPayload extracts the fields we need from service.weather.v1 events.
+type weatherPayload struct {
+	Periods []weatherPeriod `json:"periods"`
+}
+
+// weatherRequest is the payload for a service.weather.request.v1 message.
+type weatherRequest struct {
+	RequestID string `json:"requestId"`
+}
+
+// tidePayload extracts the fields we need from service.tide.v1 events.
+// TideRecord.Value uses json:"v,string" because the tides service encodes it as a JSON string.
+type tidePayload struct {
+	Current struct {
+		Time  string  `json:"t"`
+		Value float64 `json:"v,string"`
+	} `json:"current"`
+	State    string `json:"state"`
+	NextPeak *struct {
+		Time  string  `json:"time"`
+		Value float64 `json:"value"`
+		Type  string  `json:"type"`
+	} `json:"nextPeak"`
+}
 
 type RGBMatrixPlugin struct {
 	deps       core.Dependencies
@@ -40,6 +100,15 @@ type RGBMatrixPlugin struct {
 	tempIdx      int
 	nameMap      map[string]string
 	mainTempName string
+
+	infoMessages              map[string]infoMessage
+	infoKeys                  []string
+	infoIdx                   int
+	moonChannelName           string
+	sunChannelName            string
+	weatherChannelName        string
+	weatherRequestChannelName string
+	tidesChannelName          string
 }
 
 // Initialize performs one-time startup required by the service (resource loading or connectivity checks).
@@ -82,6 +151,7 @@ func (p *RGBMatrixPlugin) Initialize() error {
 	p.statuses = make(map[string]string)
 	p.lastUpdate = make(map[string]time.Time)
 	p.nameMap = make(map[string]string)
+	p.infoMessages = make(map[string]infoMessage)
 
 	if v, ok := p.cfg.Config["temp_name_map"].(map[string]interface{}); ok {
 		for k, val := range v {
@@ -206,11 +276,168 @@ func (p *RGBMatrixPlugin) Check() error {
 		return fmt.Errorf("rgbmatrix: failed to subscribe to status channel: %w", err)
 	}
 
+	// Subscribe to moon channel (optional)
+	if p.moonChannelName != "" {
+		logger.Info("rgbmatrix: subscribing to moon channel", "channel", p.moonChannelName)
+		if err := newMsgr.Subscribe(p.ctx, p.moonChannelName, "rgbmatrix-moon", func(msgCtx context.Context, msg messenger.Message) error {
+			if msg.PayloadType != moonEventType {
+				return nil
+			}
+			mp, ok := extractMoonPayload(msg)
+			if !ok {
+				return nil
+			}
+			targetTime, err := time.Parse(time.RFC3339, mp.NextMajorTime)
+			if err != nil {
+				logger.Warn("rgbmatrix: failed to parse moon target time", "error", err, "value", mp.NextMajorTime)
+				return nil
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			p.infoMessages["moon"] = infoMessage{
+				Label:     shortMoonLabel(mp.NextMajorName),
+				TargetAt:  targetTime,
+				UpdatedAt: msg.Timestamp,
+			}
+			p.rebuildInfoKeysLocked()
+			logger.Info("rgbmatrix: received moon event", "next", mp.NextMajorName, "at", targetTime)
+			return nil
+		}); err != nil {
+			logger.Error("rgbmatrix: failed to subscribe to moon channel", "channel", p.moonChannelName, "error", err)
+			return fmt.Errorf("rgbmatrix: failed to subscribe to moon channel: %w", err)
+		}
+	}
+
+	// Subscribe to sun channel (optional)
+	if p.sunChannelName != "" {
+		logger.Info("rgbmatrix: subscribing to sun channel", "channel", p.sunChannelName)
+		if err := newMsgr.Subscribe(p.ctx, p.sunChannelName, "rgbmatrix-sun", func(msgCtx context.Context, msg messenger.Message) error {
+			if msg.PayloadType != sunEventType {
+				return nil
+			}
+			sp, ok := extractSunPayload(msg)
+			if !ok {
+				return nil
+			}
+			now := time.Now()
+			var label string
+			var targetAt time.Time
+			dawnFuture := sp.CivilDawn.After(now)
+			duskFuture := sp.CivilDusk.After(now)
+			switch {
+			case dawnFuture && duskFuture:
+				if sp.CivilDawn.Before(sp.CivilDusk) {
+					label, targetAt = "dawn", sp.CivilDawn
+				} else {
+					label, targetAt = "dusk", sp.CivilDusk
+				}
+			case dawnFuture:
+				label, targetAt = "dawn", sp.CivilDawn
+			case duskFuture:
+				label, targetAt = "dusk", sp.CivilDusk
+			default:
+				return nil
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			p.infoMessages["sun"] = infoMessage{
+				Label:     label,
+				TargetAt:  targetAt,
+				UpdatedAt: msg.Timestamp,
+			}
+			p.rebuildInfoKeysLocked()
+			logger.Info("rgbmatrix: received sun event", "next", label, "at", targetAt)
+			return nil
+		}); err != nil {
+			logger.Error("rgbmatrix: failed to subscribe to sun channel", "channel", p.sunChannelName, "error", err)
+			return fmt.Errorf("rgbmatrix: failed to subscribe to sun channel: %w", err)
+		}
+	}
+
+	// Subscribe to weather channel (optional)
+	if p.weatherChannelName != "" {
+		logger.Info("rgbmatrix: subscribing to weather channel", "channel", p.weatherChannelName)
+		if err := newMsgr.Subscribe(p.ctx, p.weatherChannelName, "rgbmatrix-weather", func(msgCtx context.Context, msg messenger.Message) error {
+			if msg.PayloadType != weatherEventType {
+				return nil
+			}
+			label, ok := extractWeatherLabel(msg)
+			if !ok {
+				return nil
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			p.infoMessages["weather"] = infoMessage{
+				Label:     label,
+				UpdatedAt: msg.Timestamp,
+			}
+			p.rebuildInfoKeysLocked()
+			logger.Info("rgbmatrix: received weather event", "label", label)
+			return nil
+		}); err != nil {
+			logger.Error("rgbmatrix: failed to subscribe to weather channel", "channel", p.weatherChannelName, "error", err)
+			return fmt.Errorf("rgbmatrix: failed to subscribe to weather channel: %w", err)
+		}
+	}
+
+	// Subscribe to tides channel (optional)
+	if p.tidesChannelName != "" {
+		logger.Info("rgbmatrix: subscribing to tides channel", "channel", p.tidesChannelName)
+		if err := newMsgr.Subscribe(p.ctx, p.tidesChannelName, "rgbmatrix-tides", func(msgCtx context.Context, msg messenger.Message) error {
+			if msg.PayloadType != tideEventType {
+				return nil
+			}
+			b, err := json.Marshal(msg.Payload)
+			if err != nil {
+				return nil
+			}
+			var tp tidePayload
+			if err := json.Unmarshal(b, &tp); err != nil {
+				return nil
+			}
+
+			p.mu.Lock()
+			defer p.mu.Unlock()
+
+			var label string
+			if tp.NextPeak != nil && tp.NextPeak.Type != "" {
+				arrow := "<"
+				if tp.NextPeak.Type == "low" {
+					arrow = ">"
+				}
+				label = fmt.Sprintf("%s %s %s", tideFeetInches(tp.Current.Value), arrow, tideFeetInches(tp.NextPeak.Value))
+			} else {
+				label = tideFeetInches(tp.Current.Value)
+			}
+			p.infoMessages["tides"] = infoMessage{
+				Label:     label,
+				UpdatedAt: msg.Timestamp,
+			}
+
+			p.rebuildInfoKeysLocked()
+			return nil
+		}); err != nil {
+			logger.Error("rgbmatrix: failed to subscribe to tides channel", "channel", p.tidesChannelName, "error", err)
+			return fmt.Errorf("rgbmatrix: failed to subscribe to tides channel: %w", err)
+		}
+	}
+
+	// Request an immediate weather forecast so the display populates without waiting for the next scheduled check
+	if p.weatherRequestChannelName != "" {
+		req := &weatherRequest{RequestID: "rgbmatrix-startup"}
+		if err := newMsgr.Publish(p.ctx, p.weatherRequestChannelName, weatherRequestEventType, req); err != nil {
+			logger.Warn("rgbmatrix: failed to publish weather request", "error", err)
+		}
+	}
+
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	cycleTicker := time.NewTicker(3 * time.Second)
 	defer cycleTicker.Stop()
+
+	infoCycleTicker := time.NewTicker(5 * time.Second)
+	defer infoCycleTicker.Stop()
 
 	// Initial render
 	if err := p.Render(); err != nil {
@@ -232,6 +459,12 @@ func (p *RGBMatrixPlugin) Check() error {
 				p.tempIdx = (p.tempIdx + 1) % len(p.tempNames)
 			}
 			p.mu.Unlock()
+		case <-infoCycleTicker.C:
+			p.mu.Lock()
+			if len(p.infoKeys) > 0 {
+				p.infoIdx = (p.infoIdx + 1) % len(p.infoKeys)
+			}
+			p.mu.Unlock()
 		case <-ticker.C:
 			if err := p.Render(); err != nil {
 				logger.Error("Failed to render", "error", err)
@@ -250,6 +483,16 @@ func (p *RGBMatrixPlugin) Render() error {
 	timeStr := t.Format("3:04pm")
 	dayOfWeek := t.Format("Mon")
 	dayOfMonth := t.Format("_2") // Day of month (1-31)
+
+	// Prune stale info messages and rebuild key list (requires write lock)
+	p.mu.Lock()
+	for key, msg := range p.infoMessages {
+		if time.Since(msg.UpdatedAt) > 30*time.Minute {
+			delete(p.infoMessages, key)
+		}
+	}
+	p.rebuildInfoKeysLocked()
+	p.mu.Unlock()
 
 	// Create an image to draw the text onto
 	bounds := p.canvas.Bounds()
@@ -326,12 +569,19 @@ func (p *RGBMatrixPlugin) Render() error {
 		d.DrawString(tempNameStr)
 	}
 
-	//// 5. Draw Info (Bottom)
-	//infoStr := "keyop"
-	//d.Face = p.bigFace
-	//d.Src = image.NewUniform(p.colorRGBA(0, 100, 0, 255))
-	//d.Dot = fixed.Point26_6{X: fixed.I(0), Y: fixed.I(30)}
-	//d.DrawString(infoStr)
+	// 5. Draw rotating info message (Bottom Row)
+	if len(p.infoKeys) > 0 {
+		idx := p.infoIdx
+		if idx >= len(p.infoKeys) {
+			idx = 0
+		}
+		msg := p.infoMessages[p.infoKeys[idx]]
+		infoStr := formatCountdown(msg.Label, msg.TargetAt)
+		d.Face = p.bigFace
+		d.Src = image.NewUniform(p.colorRGBA(0, 180, 180, 255))
+		d.Dot = fixed.Point26_6{X: fixed.I(0), Y: fixed.I(31)}
+		d.DrawString(infoStr)
+	}
 
 	p.mu.RUnlock()
 
@@ -341,6 +591,131 @@ func (p *RGBMatrixPlugin) Render() error {
 	p.canvas.Render()
 
 	return nil
+}
+
+// rebuildInfoKeysLocked rebuilds the sorted infoKeys slice and clamps infoIdx.
+// Must be called while holding p.mu (write lock).
+func (p *RGBMatrixPlugin) rebuildInfoKeysLocked() {
+	keys := make([]string, 0, len(p.infoMessages))
+	for k := range p.infoMessages {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	p.infoKeys = keys
+	if len(p.infoKeys) == 0 {
+		p.infoIdx = 0
+	} else if p.infoIdx >= len(p.infoKeys) {
+		p.infoIdx = 0
+	}
+}
+
+// extractMoonPayload extracts moon countdown fields from a messenger message via JSON re-encoding.
+// This works regardless of which concrete type the messenger decoded the payload into.
+func extractMoonPayload(msg messenger.Message) (*moonPayload, bool) {
+	b, err := json.Marshal(msg.Payload)
+	if err != nil {
+		return nil, false
+	}
+	var mp moonPayload
+	if err := json.Unmarshal(b, &mp); err != nil || mp.NextMajorName == "" || mp.NextMajorTime == "" {
+		return nil, false
+	}
+	return &mp, true
+}
+
+// extractSunPayload extracts sun countdown fields from a messenger message via JSON re-encoding.
+func extractSunPayload(msg messenger.Message) (*sunPayload, bool) {
+	b, err := json.Marshal(msg.Payload)
+	if err != nil {
+		return nil, false
+	}
+	var sp sunPayload
+	if err := json.Unmarshal(b, &sp); err != nil || (sp.CivilDawn.IsZero() && sp.CivilDusk.IsZero()) {
+		return nil, false
+	}
+	return &sp, true
+}
+
+// extractWeatherLabel builds a "hi X lo Y" display string from a weather forecast message.
+func extractWeatherLabel(msg messenger.Message) (string, bool) {
+	b, err := json.Marshal(msg.Payload)
+	if err != nil {
+		return "", false
+	}
+	var wp weatherPayload
+	if err := json.Unmarshal(b, &wp); err != nil || len(wp.Periods) == 0 {
+		return "", false
+	}
+	var hi, lo float64
+	var foundHi, foundLo bool
+	for _, period := range wp.Periods {
+		if period.IsDaytime && !foundHi {
+			hi = period.Temperature
+			foundHi = true
+		}
+		if !period.IsDaytime && !foundLo {
+			lo = period.Temperature
+			foundLo = true
+		}
+		if foundHi && foundLo {
+			break
+		}
+	}
+	switch {
+	case foundHi && foundLo:
+		return fmt.Sprintf("hi %d lo %d", int(hi), int(lo)), true
+	case foundHi:
+		return fmt.Sprintf("hi %d", int(hi)), true
+	case foundLo:
+		return fmt.Sprintf("lo %d", int(lo)), true
+	default:
+		return "", false
+	}
+}
+
+// formatCountdown formats a label + remaining time until target as a compact string.
+// tideFeetInches formats a decimal-feet tide value as feet and inches,
+// treating the tenths digit directly as inches (e.g. 7.5 → 7'5").
+func tideFeetInches(v float64) string {
+	ft := int(v)
+	in := int(math.Round((v - float64(ft)) * 10))
+	if in == 10 {
+		ft++
+		in = 0
+	}
+	return fmt.Sprintf("%d'%d\"", ft, in)
+}
+
+func formatCountdown(label string, target time.Time) string {
+	rem := time.Until(target)
+	if rem <= 0 {
+		return label
+	}
+	totalMin := int(rem.Minutes())
+	days := totalMin / (24 * 60)
+	hours := (totalMin % (24 * 60)) / 60
+	mins := totalMin % 60
+	if days > 0 {
+		return fmt.Sprintf("%s %dd %dh", label, days, hours)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%s %dh %dm", label, hours, mins)
+	}
+	return fmt.Sprintf("%s %dm", label, mins)
+}
+
+func shortMoonLabel(name string) string {
+	switch name {
+	case "Full Moon":
+		return "full moon"
+	case "New Moon":
+		return "new moon"
+	default:
+		if len(name) > 4 {
+			return strings.ToLower(name[:4])
+		}
+		return strings.ToLower(name)
+	}
 }
 
 func (p *RGBMatrixPlugin) getTempColor(status string) color.RGBA {
@@ -368,6 +743,22 @@ func (p *RGBMatrixPlugin) getTempColorWithStaleness(status string, lastUpdate ti
 
 // ValidateConfig validates the service configuration and returns any validation errors.
 func (p *RGBMatrixPlugin) ValidateConfig() []error {
+	// Optional subscriptions — store channel names when configured
+	if moonSub, ok := p.cfg.Subs["moon"]; ok {
+		p.moonChannelName = moonSub.Name
+	}
+	if sunSub, ok := p.cfg.Subs["sun"]; ok {
+		p.sunChannelName = sunSub.Name
+	}
+	if weatherSub, ok := p.cfg.Subs["weather"]; ok {
+		p.weatherChannelName = weatherSub.Name
+	}
+	if weatherReqPub, ok := p.cfg.Pubs["weather-request"]; ok {
+		p.weatherRequestChannelName = weatherReqPub.Name
+	}
+	if tidesSub, ok := p.cfg.Subs["tides"]; ok {
+		p.tidesChannelName = tidesSub.Name
+	}
 	return nil
 }
 
