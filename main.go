@@ -46,8 +46,9 @@ type moonPayload struct {
 
 // sunPayload extracts the fields we need from service.sun.v1 events.
 type sunPayload struct {
-	CivilDawn time.Time `json:"civil_dawn"`
-	CivilDusk time.Time `json:"civil_dusk"`
+	CivilDawn    time.Time `json:"civil_dawn"`
+	CivilDusk    time.Time `json:"civil_dusk"`
+	TomorrowDawn time.Time `json:"tomorrow_dawn"`
 }
 
 // weatherPeriod extracts the fields we need from a ForecastPeriod.
@@ -336,7 +337,12 @@ func (p *RGBMatrixPlugin) Check() error {
 			case duskFuture:
 				label, targetAt = "dusk", sp.CivilDusk
 			default:
-				return nil
+				// All of today's events have passed — use tomorrow's dawn
+				if !sp.TomorrowDawn.IsZero() && sp.TomorrowDawn.After(now) {
+					label, targetAt = "dawn", sp.TomorrowDawn
+				} else {
+					return nil
+				}
 			}
 			p.mu.Lock()
 			defer p.mu.Unlock()
@@ -636,7 +642,9 @@ func extractSunPayload(msg messenger.Message) (*sunPayload, bool) {
 	return &sp, true
 }
 
-// extractWeatherLabel builds a "hi X lo Y" display string from a weather forecast message.
+// extractWeatherLabel builds a weather display string from a forecast message.
+// During the day the first period is daytime: shows "hi X lo Y".
+// At night the first period is nighttime: shows "lo X hi Y" (tonight's low then tomorrow's high).
 func extractWeatherLabel(msg messenger.Message) (string, bool) {
 	b, err := json.Marshal(msg.Payload)
 	if err != nil {
@@ -646,31 +654,37 @@ func extractWeatherLabel(msg messenger.Message) (string, bool) {
 	if err := json.Unmarshal(b, &wp); err != nil || len(wp.Periods) == 0 {
 		return "", false
 	}
-	var hi, lo float64
-	var foundHi, foundLo bool
+	var first, second float64
+	var foundFirst, foundSecond bool
+	firstIsDay := wp.Periods[0].IsDaytime
 	for _, period := range wp.Periods {
-		if period.IsDaytime && !foundHi {
-			hi = period.Temperature
-			foundHi = true
+		if period.IsDaytime == firstIsDay && !foundFirst {
+			first = period.Temperature
+			foundFirst = true
+		} else if period.IsDaytime != firstIsDay && !foundSecond {
+			second = period.Temperature
+			foundSecond = true
 		}
-		if !period.IsDaytime && !foundLo {
-			lo = period.Temperature
-			foundLo = true
-		}
-		if foundHi && foundLo {
+		if foundFirst && foundSecond {
 			break
 		}
 	}
-	switch {
-	case foundHi && foundLo:
-		return fmt.Sprintf("hi %d lo %d", int(hi), int(lo)), true
-	case foundHi:
-		return fmt.Sprintf("hi %d", int(hi)), true
-	case foundLo:
-		return fmt.Sprintf("lo %d", int(lo)), true
-	default:
-		return "", false
+	if firstIsDay {
+		switch {
+		case foundFirst && foundSecond:
+			return fmt.Sprintf("hi %d lo %d", int(first), int(second)), true
+		case foundFirst:
+			return fmt.Sprintf("hi %d", int(first)), true
+		}
+	} else {
+		switch {
+		case foundFirst && foundSecond:
+			return fmt.Sprintf("lo %d hi %d", int(first), int(second)), true
+		case foundFirst:
+			return fmt.Sprintf("lo %d", int(first)), true
+		}
 	}
+	return "", false
 }
 
 // formatCountdown formats a label + remaining time until target as a compact string.
@@ -696,10 +710,10 @@ func formatCountdown(label string, target time.Time) string {
 	hours := (totalMin % (24 * 60)) / 60
 	mins := totalMin % 60
 	if days > 0 {
-		return fmt.Sprintf("%s %dd %dh", label, days, hours)
+		return fmt.Sprintf("%s %dd%dh", label, days, hours)
 	}
 	if hours > 0 {
-		return fmt.Sprintf("%s %dh %dm", label, hours, mins)
+		return fmt.Sprintf("%s %dh%dm", label, hours, mins)
 	}
 	return fmt.Sprintf("%s %dm", label, mins)
 }
