@@ -1,14 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
+	"image/png"
 	"math"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +24,9 @@ import (
 	"golang.org/x/image/math/fixed"
 )
 
+//go:embed resources
+var resources embed.FS
+
 // Payload type strings matching the canonical values defined in the respective service packages.
 const (
 	moonEventType           = "service.moon.v1"
@@ -29,13 +34,24 @@ const (
 	weatherEventType        = "service.weather.v1"
 	weatherRequestEventType = "service.weather.request.v1"
 	tideEventType           = "service.tide.v1"
+	auroraEventType         = "service.aurora.v1"
 )
+
+// infoSegment is one coloured run of text within an infoMessage.
+type infoSegment struct {
+	Text  string
+	Color *color.RGBA // nil → use the message's Color (or default cyan)
+}
 
 // infoMessage holds a rotating bottom-row display item with staleness tracking.
 type infoMessage struct {
 	Label     string
 	TargetAt  time.Time
 	UpdatedAt time.Time
+	FormatFn  func(label string, target time.Time) string // nil → formatCountdown
+	Icon      image.Image                                 // optional left-side icon (nil if none)
+	Color     *color.RGBA                                 // optional text color (nil → default cyan)
+	Segments  []infoSegment                               // when set, rendered instead of Label
 }
 
 // moonPayload extracts the fields we need from service.moon.v1 events.
@@ -110,6 +126,7 @@ type RGBMatrixPlugin struct {
 	weatherChannelName        string
 	weatherRequestChannelName string
 	tidesChannelName          string
+	auroraChannelName         string
 }
 
 // Initialize performs one-time startup required by the service (resource loading or connectivity checks).
@@ -187,7 +204,7 @@ func (p *RGBMatrixPlugin) Initialize() error {
 }
 
 func loadFontFace(path string, size float64) (font.Face, error) {
-	fontBytes, err := os.ReadFile(path) //nolint:gosec // reading bundled resource file path
+	fontBytes, err := resources.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read font file %s: %w", path, err)
 	}
@@ -211,6 +228,14 @@ func (p *RGBMatrixPlugin) colorRGBA(r, g, b, a uint8) color.RGBA {
 		return color.RGBA{r, b, g, a}
 	}
 	return color.RGBA{r, g, b, a}
+}
+
+// swapGBImage wraps an image.Image and swaps the green and blue channels in At().
+type swapGBImage struct{ image.Image }
+
+func (s swapGBImage) At(x, y int) color.Color {
+	r, g, b, a := s.Image.At(x, y).RGBA()
+	return color.RGBA64{R: uint16(r), G: uint16(b), B: uint16(g), A: uint16(a)}
 }
 
 // Check performs the service's periodic work: collect data, evaluate state, and publish messages/metrics.
@@ -293,12 +318,15 @@ func (p *RGBMatrixPlugin) Check() error {
 				logger.Warn("rgbmatrix: failed to parse moon target time", "error", err, "value", mp.NextMajorTime)
 				return nil
 			}
+			icon := loadIcon(moonPhaseIconPath(mp.NextMajorName))
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			p.infoMessages["moon"] = infoMessage{
 				Label:     shortMoonLabel(mp.NextMajorName),
 				TargetAt:  targetTime,
 				UpdatedAt: msg.Timestamp,
+				FormatFn:  formatCountdown,
+				Icon:      icon,
 			}
 			p.rebuildInfoKeysLocked()
 			logger.Info("rgbmatrix: received moon event", "next", mp.NextMajorName, "at", targetTime)
@@ -321,25 +349,25 @@ func (p *RGBMatrixPlugin) Check() error {
 				return nil
 			}
 			now := time.Now()
-			var label string
+			var iconPath string
 			var targetAt time.Time
 			dawnFuture := sp.CivilDawn.After(now)
 			duskFuture := sp.CivilDusk.After(now)
 			switch {
 			case dawnFuture && duskFuture:
 				if sp.CivilDawn.Before(sp.CivilDusk) {
-					label, targetAt = "dawn", sp.CivilDawn
+					iconPath, targetAt = "resources/dawn.png", sp.CivilDawn
 				} else {
-					label, targetAt = "dusk", sp.CivilDusk
+					iconPath, targetAt = "resources/dusk.png", sp.CivilDusk
 				}
 			case dawnFuture:
-				label, targetAt = "dawn", sp.CivilDawn
+				iconPath, targetAt = "resources/dawn.png", sp.CivilDawn
 			case duskFuture:
-				label, targetAt = "dusk", sp.CivilDusk
+				iconPath, targetAt = "resources/dusk.png", sp.CivilDusk
 			default:
 				// All of today's events have passed — use tomorrow's dawn
 				if !sp.TomorrowDawn.IsZero() && sp.TomorrowDawn.After(now) {
-					label, targetAt = "dawn", sp.TomorrowDawn
+					iconPath, targetAt = "resources/dawn.png", sp.TomorrowDawn
 				} else {
 					return nil
 				}
@@ -347,12 +375,13 @@ func (p *RGBMatrixPlugin) Check() error {
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			p.infoMessages["sun"] = infoMessage{
-				Label:     label,
+				Label:     "",
 				TargetAt:  targetAt,
 				UpdatedAt: msg.Timestamp,
+				Icon:      loadIcon(iconPath),
 			}
 			p.rebuildInfoKeysLocked()
-			logger.Info("rgbmatrix: received sun event", "next", label, "at", targetAt)
+			logger.Info("rgbmatrix: received sun event", "next", iconPath, "at", targetAt)
 			return nil
 		}); err != nil {
 			logger.Error("rgbmatrix: failed to subscribe to sun channel", "channel", p.sunChannelName, "error", err)
@@ -405,19 +434,36 @@ func (p *RGBMatrixPlugin) Check() error {
 			p.mu.Lock()
 			defer p.mu.Unlock()
 
-			var label string
-			if tp.NextPeak != nil && tp.NextPeak.Type != "" {
-				arrow := "<"
-				if tp.NextPeak.Type == "low" {
-					arrow = ">"
+			red := &color.RGBA{R: 255, G: 0, B: 0, A: 255}
+			tideColor := func(v float64) *color.RGBA {
+				if v > 10 || v < 0 {
+					return red
 				}
-				label = fmt.Sprintf("%s %s %s", tideFeetInches(tp.Current.Value), arrow, tideFeetInches(tp.NextPeak.Value))
-			} else {
-				label = tideFeetInches(tp.Current.Value)
+				return nil
+			}
+			var segments []infoSegment
+			segments = append(segments, infoSegment{
+				Text:  tideFeetInches(tp.Current.Value),
+				Color: tideColor(tp.Current.Value),
+			})
+			if tp.NextPeak != nil && tp.NextPeak.Type != "" {
+				segments = append(segments, infoSegment{Text: " "})
+				segments = append(segments, infoSegment{
+					Text:  tideFeetInches(tp.NextPeak.Value),
+					Color: tideColor(tp.NextPeak.Value),
+				})
+			}
+			tideIconPath := ""
+			switch tp.State {
+			case "rising":
+				tideIconPath = "resources/tide_rising.png"
+			case "falling":
+				tideIconPath = "resources/tide_falling.png"
 			}
 			p.infoMessages["tides"] = infoMessage{
-				Label:     label,
+				Segments:  segments,
 				UpdatedAt: msg.Timestamp,
+				Icon:      loadIcon(tideIconPath),
 			}
 
 			p.rebuildInfoKeysLocked()
@@ -425,6 +471,44 @@ func (p *RGBMatrixPlugin) Check() error {
 		}); err != nil {
 			logger.Error("rgbmatrix: failed to subscribe to tides channel", "channel", p.tidesChannelName, "error", err)
 			return fmt.Errorf("rgbmatrix: failed to subscribe to tides channel: %w", err)
+		}
+	}
+
+	// Subscribe to aurora channel (optional)
+	if p.auroraChannelName != "" {
+		logger.Info("rgbmatrix: subscribing to aurora channel", "channel", p.auroraChannelName)
+		if err := newMsgr.Subscribe(p.ctx, p.auroraChannelName, "rgbmatrix-aurora", func(msgCtx context.Context, msg messenger.Message) error {
+			if msg.PayloadType != auroraEventType {
+				return nil
+			}
+			b, err := json.Marshal(msg.Payload)
+			if err != nil {
+				return nil
+			}
+			var ap struct {
+				Likelihood int `json:"likelihood"`
+			}
+			if err := json.Unmarshal(b, &ap); err != nil {
+				return nil
+			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if ap.Likelihood == 0 {
+				delete(p.infoMessages, "aurora")
+			} else {
+				pink := color.RGBA{R: 255, G: 105, B: 180, A: 255}
+				p.infoMessages["aurora"] = infoMessage{
+					Label:     fmt.Sprintf("aurora %d%%", ap.Likelihood),
+					UpdatedAt: msg.Timestamp,
+					Color:     &pink,
+				}
+			}
+			p.rebuildInfoKeysLocked()
+			logger.Info("rgbmatrix: received aurora event", "likelihood", ap.Likelihood)
+			return nil
+		}); err != nil {
+			logger.Error("rgbmatrix: failed to subscribe to aurora channel", "channel", p.auroraChannelName, "error", err)
+			return fmt.Errorf("rgbmatrix: failed to subscribe to aurora channel: %w", err)
 		}
 	}
 
@@ -582,11 +666,39 @@ func (p *RGBMatrixPlugin) Render() error {
 			idx = 0
 		}
 		msg := p.infoMessages[p.infoKeys[idx]]
-		infoStr := formatCountdown(msg.Label, msg.TargetAt)
 		d.Face = p.bigFace
-		d.Src = image.NewUniform(p.colorRGBA(0, 180, 180, 255))
-		d.Dot = fixed.Point26_6{X: fixed.I(0), Y: fixed.I(31)}
-		d.DrawString(infoStr)
+		defaultColor := p.colorRGBA(0, 180, 180, 255)
+		if msg.Color != nil {
+			defaultColor = p.colorRGBA(msg.Color.R, msg.Color.G, msg.Color.B, msg.Color.A)
+		}
+		d.Src = image.NewUniform(defaultColor)
+		textX := 0
+		if msg.Icon != nil {
+			ib := msg.Icon.Bounds()
+			src := image.Image(msg.Icon)
+			if p.swapGB {
+				src = swapGBImage{msg.Icon}
+			}
+			draw.Draw(img, image.Rect(1, 31-ib.Dy(), 1+ib.Dx(), 31), src, ib.Min, draw.Over)
+			textX = 1 + ib.Dx() + 5
+		}
+		d.Dot = fixed.Point26_6{X: fixed.I(textX), Y: fixed.I(31)}
+		if len(msg.Segments) > 0 {
+			for _, seg := range msg.Segments {
+				if seg.Color != nil {
+					d.Src = image.NewUniform(p.colorRGBA(seg.Color.R, seg.Color.G, seg.Color.B, seg.Color.A))
+				} else {
+					d.Src = image.NewUniform(defaultColor)
+				}
+				d.DrawString(seg.Text)
+			}
+		} else {
+			format := formatCountdown
+			if msg.FormatFn != nil {
+				format = msg.FormatFn
+			}
+			d.DrawString(format(msg.Label, msg.TargetAt))
+		}
 	}
 
 	p.mu.RUnlock()
@@ -691,13 +803,30 @@ func extractWeatherLabel(msg messenger.Message) (string, bool) {
 // tideFeetInches formats a decimal-feet tide value as feet and inches,
 // treating the tenths digit directly as inches (e.g. 7.5 → 7'5").
 func tideFeetInches(v float64) string {
+	sign := ""
+	if v < 0 {
+		sign = "-"
+		v = -v
+	}
 	ft := int(v)
 	in := int(math.Round((v - float64(ft)) * 10))
 	if in == 10 {
 		ft++
 		in = 0
 	}
-	return fmt.Sprintf("%d'%d\"", ft, in)
+	return fmt.Sprintf("%s%d'%d\"", sign, ft, in)
+}
+
+func formatMoonCountdown(label string, target time.Time) string {
+	rem := time.Until(target)
+	if rem <= 0 {
+		return label
+	}
+	hours := int(rem.Hours())
+	if hours >= 24 {
+		return fmt.Sprintf("%s %dd", label, hours/24)
+	}
+	return fmt.Sprintf("%s %dh", label, hours)
 }
 
 func formatCountdown(label string, target time.Time) string {
@@ -709,21 +838,63 @@ func formatCountdown(label string, target time.Time) string {
 	days := totalMin / (24 * 60)
 	hours := (totalMin % (24 * 60)) / 60
 	mins := totalMin % 60
+	sep := " "
+	if label == "" {
+		sep = ""
+	}
 	if days > 0 {
-		return fmt.Sprintf("%s %dd%dh", label, days, hours)
+		return fmt.Sprintf("%s%s%dd%dh", label, sep, days, hours)
 	}
 	if hours > 0 {
-		return fmt.Sprintf("%s %dh%dm", label, hours, mins)
+		return fmt.Sprintf("%s%s%dh%dm", label, sep, hours, mins)
 	}
-	return fmt.Sprintf("%s %dm", label, mins)
+	return fmt.Sprintf("%s%s%dm", label, sep, mins)
+}
+
+func moonPhaseIconPath(name string) string {
+	switch name {
+	case "Full Moon":
+		return "resources/moon-9x7-full.png"
+	case "New Moon":
+		return "resources/moon-9x7-new.png"
+	case "First Quarter":
+		return "resources/moon-9x7-first_quarter.png"
+	case "Last Quarter":
+		return "resources/moon-9x7-last_quarter.png"
+	case "Waxing Crescent":
+		return "resources/moon-9x7-waxing_crescent.png"
+	case "Waxing Gibbous":
+		return "resources/moon-9x7-waxing_gibbous.png"
+	case "Waning Gibbous":
+		return "resources/moon-9x7-waning_gibbous.png"
+	case "Waning Crescent":
+		return "resources/moon-9x7-waning_crescent.png"
+	default:
+		return ""
+	}
+}
+
+func loadIcon(path string) image.Image {
+	if path == "" {
+		return nil
+	}
+	data, err := resources.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil
+	}
+	return img
 }
 
 func shortMoonLabel(name string) string {
 	switch name {
 	case "Full Moon":
-		return "full moon"
+		return "full"
 	case "New Moon":
-		return "new moon"
+		return "new"
 	default:
 		if len(name) > 4 {
 			return strings.ToLower(name[:4])
@@ -772,6 +943,9 @@ func (p *RGBMatrixPlugin) ValidateConfig() []error {
 	}
 	if tidesSub, ok := p.cfg.Subs["tides"]; ok {
 		p.tidesChannelName = tidesSub.Name
+	}
+	if auroraSub, ok := p.cfg.Subs["aurora"]; ok {
+		p.auroraChannelName = auroraSub.Name
 	}
 	return nil
 }
