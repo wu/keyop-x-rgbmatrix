@@ -496,7 +496,7 @@ func (p *RGBMatrixPlugin) Check() error {
 			if ap.Likelihood == 0 {
 				delete(p.infoMessages, "aurora")
 			} else {
-				pink := color.RGBA{R: 255, G: 105, B: 180, A: 255}
+				pink := color.RGBA{R: 255, G: 0, B: 255, A: 150}
 				p.infoMessages["aurora"] = infoMessage{
 					Label:     fmt.Sprintf("aurora %d%%", ap.Likelihood),
 					UpdatedAt: msg.Timestamp,
@@ -591,7 +591,7 @@ func (p *RGBMatrixPlugin) Render() error {
 	// Draw text to the image
 	d := &font.Drawer{
 		Dst: img,
-		Src: image.NewUniform(p.colorRGBA(100, 0, 255, 255)),
+		Src: image.NewUniform(p.colorRGBA(150, 0, 255, 255)),
 	}
 
 	// 1. Draw Day of Week (Upper Left)
