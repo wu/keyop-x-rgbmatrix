@@ -325,7 +325,7 @@ func (p *RGBMatrixPlugin) Check() error {
 				Label:     shortMoonLabel(mp.NextMajorName),
 				TargetAt:  targetTime,
 				UpdatedAt: msg.Timestamp,
-				FormatFn:  formatCountdown,
+				FormatFn:  formatMoonCountdown,
 				Icon:      icon,
 			}
 			p.rebuildInfoKeysLocked()
@@ -436,7 +436,7 @@ func (p *RGBMatrixPlugin) Check() error {
 
 			red := &color.RGBA{R: 255, G: 0, B: 0, A: 255}
 			tideColor := func(v float64) *color.RGBA {
-				if v > 10 || v < 0 {
+				if v > 12 || v < 0 {
 					return red
 				}
 				return nil
@@ -680,7 +680,7 @@ func (p *RGBMatrixPlugin) Render() error {
 				src = swapGBImage{msg.Icon}
 			}
 			draw.Draw(img, image.Rect(1, 31-ib.Dy(), 1+ib.Dx(), 31), src, ib.Min, draw.Over)
-			textX = 1 + ib.Dx() + 5
+			textX = 1 + ib.Dx() + 4
 		}
 		d.Dot = fixed.Point26_6{X: fixed.I(textX), Y: fixed.I(31)}
 		if len(msg.Segments) > 0 {
@@ -817,18 +817,6 @@ func tideFeetInches(v float64) string {
 	return fmt.Sprintf("%s%d'%d\"", sign, ft, in)
 }
 
-func formatMoonCountdown(label string, target time.Time) string {
-	rem := time.Until(target)
-	if rem <= 0 {
-		return label
-	}
-	hours := int(rem.Hours())
-	if hours >= 24 {
-		return fmt.Sprintf("%s %dd", label, hours/24)
-	}
-	return fmt.Sprintf("%s %dh", label, hours)
-}
-
 func formatCountdown(label string, target time.Time) string {
 	rem := time.Until(target)
 	if rem <= 0 {
@@ -847,6 +835,33 @@ func formatCountdown(label string, target time.Time) string {
 	}
 	if hours > 0 {
 		return fmt.Sprintf("%s%s%dh%dm", label, sep, hours, mins)
+	}
+	return fmt.Sprintf("%s%s%dm", label, sep, mins)
+}
+
+// formatMoonCountdown formats moon phase countdown with rules:
+// >9 days → "9d", ≤9d and >24h → "1d4h", ≤24h and >1h → "2h", ≤1h → "15m"
+func formatMoonCountdown(label string, target time.Time) string {
+	rem := time.Until(target)
+	if rem <= 0 {
+		return label
+	}
+	sep := " "
+	if label == "" {
+		sep = ""
+	}
+	totalMin := int(rem.Minutes())
+	days := totalMin / (24 * 60)
+	hours := (totalMin % (24 * 60)) / 60
+	mins := totalMin % 60
+	if days > 9 {
+		return fmt.Sprintf("%s%s%dd", label, sep, days)
+	}
+	if days > 0 {
+		return fmt.Sprintf("%s%s%dd%dh", label, sep, days, hours)
+	}
+	if hours > 0 {
+		return fmt.Sprintf("%s%s%dh", label, sep, hours)
 	}
 	return fmt.Sprintf("%s%s%dm", label, sep, mins)
 }
