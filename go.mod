@@ -8,7 +8,7 @@ replace github.com/wu/keyop => ../keyop-public
 
 require (
 	github.com/mcuadros/go-rpi-rgb-led-matrix v0.0.0-20180401002551-b26063b3169a
-	github.com/wu/keyop-messenger v1.2.0
+	github.com/wu/keyop-messenger v1.3.0
 	golang.org/x/image v0.36.0
 )
 
